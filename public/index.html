@@ -1,1 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prism Proxy</title>
+  <style>
+    :root {
+      --bg: #0e1117;
+      --panel: #161b22;
+      --border: #2a313c;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --accent: #7aa2ff;
+      --ok: #3fb950;
+      --warn: #d29922;
+      --err: #f85149;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+    }
+    .brand { font-weight: 650; letter-spacing: .2px; margin-right: 6px; }
+    form { flex: 1; display: flex; gap: 8px; min-width: 0; }
+    input[type="text"] {
+      flex: 1;
+      min-width: 0;
+      padding: 9px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+      outline: none;
+    }
+    input[type="text"]:focus { border-color: var(--accent); }
+    button {
+      padding: 9px 14px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+      cursor: pointer;
+    }
+    button:hover { border-color: var(--accent); }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #0b1020; font-weight: 600; }
+    #status { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+    #dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); }
+    #dot.ok { background: var(--ok); }
+    #dot.err { background: var(--err); }
+    main { flex: 1; position: relative; min-height: 0; }
+    #frame { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: #fff; display: none; }
+    #home {
+      position: absolute; inset: 0;
+      display: grid; place-items: center; text-align: center; padding: 24px;
+    }
+    #home h1 { margin: 0 0 8px; font-size: 28px; }
+    #home p { margin: 0; color: var(--muted); max-width: 460px; line-height: 1.5; }
+    #error {
+      display: none; margin: 14px; padding: 10px 12px; border-radius: 8px;
+      border: 1px solid var(--err); color: var(--err); font-size: 13px; white-space: pre-wrap;
+    }
+    @media (max-width: 560px) {
+      .brand, #statusText { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <span class="brand">Prism</span>
+    <button id="back" type="button" title="Back">&larr;</button>
+    <button id="forward" type="button" title="Forward">&rarr;</button>
+    <button id="reload" type="button" title="Reload">&#8635;</button>
+    <form id="form" autocomplete="off">
+      <input id="address" type="text" placeholder="Search or enter a URL" spellcheck="false" autofocus>
+      <button class="primary" type="submit">Go</button>
+    </form>
+    <div id="status"><span id="dot"></span><span id="statusText">Connecting&hellip;</span></div>
+  </header>
+
+  <div id="error"></div>
+
+  <main>
+    <div id="home">
+      <div>
+        <h1>Browse through the proxy</h1>
+        <p>Type a URL or a search above. Traffic is routed through your Wisp server.</p>
+      </div>
+    </div>
+    <iframe id="frame" title="Proxied page"></iframe>
+  </main>
+
+  <!-- Ultraviolet client pieces and the bare-mux connection library -->
+  <script src="/uv/uv.bundle.js"></script>
+  <script src="/uv/uv.config.js"></script>
+  <script src="/baremux/index.js"></script>
+  <script>
+    "use strict";
+
+    // ---- Configuration ------------------------------------------------------
+    const WISP_URL = "wss://bare-server.fly.dev/wisp/";
+    const SEARCH_URL = "https://duckduckgo.com/?q=%s";
+
+    // ---- Elements -----------------------------------------------------------
+    const $ = (id) => document.getElementById(id);
+    const form = $("form");
+    const address = $("address");
+    const frame = $("frame");
+    const home = $("home");
+    const errorBox = $("error");
+    const dot = $("dot");
+    const statusText = $("statusText");
+
+    function setStatus(kind, text) {
+      dot.className = kind;
+      statusText.textContent = text;
+    }
+
+    function showError(message) {
+      errorBox.textContent = message;
+      errorBox.style.display = "block";
+    }
+
+    function clearError() {
+      errorBox.style.display = "none";
+    }
+
+    // ---- URL / search handling ---------------------------------------------
+    function toUrl(input) {
+      const value = input.trim();
+      if (!value) return null;
+
+      // Already a full URL with a scheme
+      try {
+        const u = new URL(value);
+        if (u.protocol === "http:" || u.protocol === "https:") return u.toString();
+      } catch (_) { /* not a full URL */ }
+
+      // Looks like a hostname (contains a dot, no spaces)
+      if (!value.includes(" ") && /^[^\s]+\.[^\s]{2,}$/.test(value)) {
+        try { return new URL("https://" + value).toString(); } catch (_) { /* fall through */ }
+      }
+
+      return SEARCH_URL.replace("%s", encodeURIComponent(value));
+    }
+
+    function proxied(url) {
+      return __uv$config.prefix + __uv$config.encodeUrl(url);
+    }
+
+    // ---- Transport + service worker ----------------------------------------
+    let ready = null;
+
+    function init() {
+      if (ready) return ready;
+
+      ready = (async () => {
+        if (!("serviceWorker" in navigator)) {
+          throw new Error("Service workers are not supported in this browser.");
+        }
+        // Service workers need HTTPS or localhost.
+        if (location.protocol !== "https:" && location.hostname !== "localhost" && location.hostname !== "127.0.0.1") {
+          throw new Error("Service workers require HTTPS (or localhost). Serve this site over HTTPS.");
+        }
+
+        await navigator.serviceWorker.register("/sw.js", { scope: __uv$config.prefix });
+        await navigator.serviceWorker.ready;
+
+        const connection = new BareMux.BareMuxConnection("/baremux/worker.js");
+        await connection.setTransport("/epoxy/index.mjs", [{ wisp: WISP_URL }]);
+
+        setStatus("ok", "Connected");
+      })();
+
+      ready.catch((err) => {
+        setStatus("err", "Failed");
+        showError("Setup failed: " + (err && err.message ? err.message : err));
+        ready = null; // allow retry
+      });
+
+      return ready;
+    }
+
+    // ---- Navigation --------------------------------------------------------
+    async function go(input) {
+      clearError();
+      const url = toUrl(input);
+      if (!url) return;
+
+      try {
+        await init();
+      } catch (_) {
+        return;
+      }
+
+      home.style.display = "none";
+      frame.style.display = "block";
+      frame.src = proxied(url);
+      address.value = url;
+    }
+
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      go(address.value);
+    });
+
+    $("back").addEventListener("click", () => { try { frame.contentWindow.history.back(); } catch (_) {} });
+    $("forward").addEventListener("click", () => { try { frame.contentWindow.history.forward(); } catch (_) {} });
+    $("reload").addEventListener("click", () => { try { frame.contentWindow.location.reload(); } catch (_) {} });
+
+    // Keep the address bar in sync with the page being viewed.
+    frame.addEventListener("load", () => {
+      try {
+        const path = frame.contentWindow.location.pathname + frame.contentWindow.location.search + frame.contentWindow.location.hash;
+        if (path.startsWith(__uv$config.prefix)) {
+          const encoded = path.slice(__uv$config.prefix.length);
+          address.value = __uv$config.decodeUrl(encoded);
+        }
+      } catch (_) { /* cross-origin or not ready */ }
+    });
+
+    // Warm up the connection on load so the first navigation is fast.
+    setStatus("", "Connecting…");
+    init();
+  </script>
+</body>
+</html>
 
