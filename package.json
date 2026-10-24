@@ -1,0 +1,17 @@
+{
+  "name": "proxy-site",
+  "version": "1.0.0",
+  "description": "Ultraviolet web proxy using an Epoxy transport over a Wisp server",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@mercuryworkshop/bare-mux": "latest",
+    "@mercuryworkshop/epoxy-transport": "latest",
+    "@titaniumnetwork-dev/ultraviolet": "latest",
+    "express": "^4.19.2"
+  },
+  "license": "ISC"
+}
